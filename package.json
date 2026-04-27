@@ -1,10 +1,9 @@
 {
   "name": "flock-telemetry",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "type": "module",
-  "main": "index.js",
   "scripts": {
-    "start": "node index.js"
+    "start": "./start.sh"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.39.0"

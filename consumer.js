@@ -1,44 +1,27 @@
 import { createClient } from '@supabase/supabase-js'
-import { createServer } from 'https'
-import { createServer as createHttpServer } from 'http'
-import { readFileSync } from 'fs'
-import crypto from 'crypto'
+import { createInterface } from 'readline'
 
 const supabase = createClient(
   process.env.SUPABASE_URL,
   process.env.SUPABASE_SERVICE_ROLE_KEY
 )
 
-// ── TELEMETRY FIELD HANDLERS ──
-// Maps Tesla field names to our DB columns
 const FIELD_MAP = {
-  // Location
   'Location':                   handleLocation,
   'VehicleSpeed':               handleSpeed,
   'Heading':                    handleHeading,
-
-  // Battery
   'BatteryLevel':               handleBattery,
   'ChargingState':              handleChargingState,
-
-  // Drive
   'Gear':                       handleGear,
   'Odometer':                   handleOdometer,
-
-  // Safety events (counted)
   'ForwardCollisionWarning':    handleCollisionWarning,
   'LaneDepartureAvoidance':     handleLaneDeparture,
-
-  // Autopilot
   'AutopilotEnabled':           handleAutopilot,
   'AutopilotState':             handleAutopilotState,
-
-  // Turn signals
   'TurnSignalLeft':             handleTurnSignal,
   'TurnSignalRight':            handleTurnSignal,
 }
 
-// Per-vehicle in-memory state (persisted to Supabase periodically)
 const vehicleState = {}
 
 function getState(vin) {
@@ -59,8 +42,6 @@ function getState(vin) {
   }
   return vehicleState[vin]
 }
-
-// ── FIELD HANDLERS ──
 
 async function handleLocation(vin, value) {
   const s = getState(vin)
@@ -89,33 +70,20 @@ async function handleGear(vin, value) {
   const s = getState(vin)
   const prevGear = s.gear
   s.gear = value
-
   const isDriving = ['D','R','N'].includes(value)
   const wasDriving = ['D','R','N'].includes(prevGear)
-
-  if (isDriving && !wasDriving) {
-    await startTrip(vin, s)
-  } else if (!isDriving && wasDriving && s.activeTripId) {
-    await endTrip(vin, s)
-  }
+  if (isDriving && !wasDriving) await startTrip(vin, s)
+  else if (!isDriving && wasDriving && s.activeTripId) await endTrip(vin, s)
 }
 
 async function handleOdometer(vin, value) {
   const s = getState(vin)
   const prev = s.odometer
-
   if (prev && value && value > prev) {
     const delta = value - prev
-    if (s.autopilotEnabled) {
-      s.autopilotDistance += delta
-    } else {
-      s.manualDistance += delta
-    }
-    // Write trip point if driving
-    if (s.activeTripId && s.lat && s.lng) {
-      await writeTripPoint(vin, s)
-    }
-    // Update stats in DB
+    if (s.autopilotEnabled) s.autopilotDistance += delta
+    else s.manualDistance += delta
+    if (s.activeTripId && s.lat && s.lng) await writeTripPoint(vin, s)
     await updateDrivingStats(vin, s)
   }
   s.lastOdometer = s.odometer
@@ -126,7 +94,7 @@ async function handleCollisionWarning(vin, value) {
   const s = getState(vin)
   if (value && value !== 'None' && value !== false) {
     s.collisionWarnings++
-    console.log(`⚠️ Collision warning for ${vin}: ${value} (total: ${s.collisionWarnings})`)
+    console.error(`⚠️  Collision warning ${vin}: ${value} (total: ${s.collisionWarnings})`)
     await supabase.from('vehicle_safety_events').insert({
       vehicle_id: await getVehicleId(vin),
       event_type: 'collision_warning',
@@ -141,7 +109,7 @@ async function handleLaneDeparture(vin, value) {
   const s = getState(vin)
   if (value && value !== 'None' && value !== 'LaneDepartureAvoidanceStateOff') {
     s.laneDepartures++
-    console.log(`⚠️ Lane departure for ${vin}: ${value} (total: ${s.laneDepartures})`)
+    console.error(`⚠️  Lane departure ${vin}: ${value} (total: ${s.laneDepartures})`)
     await supabase.from('vehicle_safety_events').insert({
       vehicle_id: await getVehicleId(vin),
       event_type: 'lane_departure',
@@ -153,9 +121,7 @@ async function handleLaneDeparture(vin, value) {
 }
 
 async function handleAutopilot(vin, value) {
-  const s = getState(vin)
-  s.autopilotEnabled = value === true || value === 'true'
-  console.log(`🤖 Autopilot ${s.autopilotEnabled ? 'ON' : 'OFF'} for ${vin}`)
+  getState(vin).autopilotEnabled = value === true || value === 'true'
 }
 
 async function handleAutopilotState(vin, value) {
@@ -166,7 +132,6 @@ async function handleTurnSignal(vin, value, field) {
   const s = getState(vin)
   if (field === 'TurnSignalLeft') s.turnSignalLeft = !!value
   if (field === 'TurnSignalRight') s.turnSignalRight = !!value
-  // Update location with turn signal state
   await maybeWriteLocation(vin)
 }
 
@@ -184,13 +149,10 @@ async function maybeWriteLocation(vin) {
   const s = getState(vin)
   if (!s.lat || !s.lng) return
   const now = Date.now()
-  // Throttle location writes to max once per 5s
   if (now - s.lastWritten < 5000) return
   s.lastWritten = now
-
   const vehicleId = await getVehicleId(vin)
   if (!vehicleId) return
-
   await supabase.from('vehicle_locations').insert({
     vehicle_id: vehicleId,
     latitude: s.lat,
@@ -228,7 +190,7 @@ async function startTrip(vin, s) {
   if (trip) {
     s.activeTripId = trip.id
     s.tripStartOdometer = s.odometer
-    console.log(`🚗 Trip started: ${vin} tripId=${trip.id}`)
+    console.error(`🚗 Trip started: ${vin} tripId=${trip.id}`)
   }
 }
 
@@ -243,7 +205,7 @@ async function endTrip(vin, s) {
     end_location: s.lat && s.lng ? `${s.lat},${s.lng}` : null,
     distance_miles: distance
   }).eq('id', s.activeTripId)
-  console.log(`🏁 Trip ended: ${vin} distance=${distance}mi`)
+  console.error(`🏁 Trip ended: ${vin} distance=${distance}mi`)
   s.activeTripId = null
   s.tripStartOdometer = null
 }
@@ -270,22 +232,26 @@ async function updateSafetyStats(vin, s) {
   }, { onConflict: 'vehicle_id' })
 }
 
-// ── TELEMETRY PAYLOAD PROCESSOR ──
+// ── PAYLOAD PROCESSOR ──
+// Handles both proto JSON format {key, value: {floatValue: x}}
+// and simplified format {key, value: x}
 
 async function processTelemetryPayload(payload) {
   const vin = payload.vin
-  if (!vin) { console.warn('No VIN in payload'); return }
+  if (!vin) return
 
   const data = payload.data || []
   for (const field of data) {
     const fieldName = field.key
-    const value = field.value?.stringValue
-      ?? field.value?.doubleValue
-      ?? field.value?.floatValue
-      ?? field.value?.intValue
-      ?? field.value?.booleanValue
-      ?? field.value?.locationValue
-      ?? field.value
+    const raw = field.value
+    const value = raw?.stringValue
+      ?? raw?.doubleValue
+      ?? raw?.floatValue
+      ?? raw?.intValue
+      ?? raw?.int32Value
+      ?? raw?.booleanValue
+      ?? raw?.locationValue
+      ?? raw
 
     const handler = FIELD_MAP[fieldName]
     if (handler) {
@@ -298,41 +264,26 @@ async function processTelemetryPayload(payload) {
   }
 }
 
-// ── HTTP SERVER ──
-// Railway provides HTTPS termination so we just need HTTP
+// ── STDIN READER ──
+// Reads JSON lines from fleet-telemetry Go server (piped via stdout)
+// App logs have no 'vin'; telemetry records do.
 
-const server = createHttpServer(async (req, res) => {
-  if (req.method === 'GET' && req.url === '/health') {
-    res.writeHead(200, { 'Content-Type': 'application/json' })
-    res.end(JSON.stringify({ status: 'ok', vehicles: Object.keys(vehicleState).length }))
-    return
+const rl = createInterface({ input: process.stdin, crlfDelay: Infinity })
+
+rl.on('line', async (line) => {
+  if (!line.trim()) return
+  try {
+    const record = JSON.parse(line)
+    if (!record.vin) return
+    await processTelemetryPayload(record)
+  } catch {
+    // ignore parse errors from non-JSON log lines
   }
-
-  if (req.method === 'POST' && req.url === '/telemetry') {
-    let body = ''
-    req.on('data', chunk => body += chunk)
-    req.on('end', async () => {
-      try {
-        const payload = JSON.parse(body)
-        console.log(`[${new Date().toISOString()}] Telemetry from ${payload.vin}: ${(payload.data||[]).map(d=>d.key).join(', ')}`)
-        await processTelemetryPayload(payload)
-        res.writeHead(200)
-        res.end('OK')
-      } catch (err) {
-        console.error('Parse error:', err.message)
-        res.writeHead(400)
-        res.end('Bad Request')
-      }
-    })
-    return
-  }
-
-  res.writeHead(404)
-  res.end('Not Found')
 })
 
-const PORT = process.env.PORT || 3001
-server.listen(PORT, () => {
-  console.log(`Tesla telemetry server listening on port ${PORT}`)
-  console.log('Endpoints: POST /telemetry | GET /health')
+rl.on('close', () => {
+  console.error('stdin closed — fleet-telemetry process exited')
+  process.exit(0)
 })
+
+console.error('Consumer ready — reading telemetry from fleet-telemetry server')
