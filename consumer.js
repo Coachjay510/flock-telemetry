@@ -38,6 +38,7 @@ function getState(vin) {
       lastOdometer: null, lastGear: null,
       activeTripId: null, tripStartOdometer: null,
       lastWritten: 0,
+      lastStreetOdometer: null,
     }
   }
   return vehicleState[vin]
@@ -85,6 +86,7 @@ async function handleOdometer(vin, value) {
     else s.manualDistance += delta
     if (s.activeTripId && s.lat && s.lng) await writeTripPoint(vin, s)
     await updateDrivingStats(vin, s)
+    await maybeLogStreet(vin, s)
   }
   s.lastOdometer = s.odometer
   s.odometer = value
@@ -143,6 +145,16 @@ async function getVehicleId(vin) {
   const { data } = await supabase.from('vehicles').select('id').eq('vin', vin).single()
   if (data) vehicleIdCache[vin] = data.id
   return data?.id
+}
+
+const ownerCache = {}
+async function getOwner(vin) {
+  if (ownerCache[vin]) return ownerCache[vin]
+  const vehicleId = await getVehicleId(vin)
+  if (!vehicleId) return null
+  const { data } = await supabase.from('vehicles').select('owner_id').eq('id', vehicleId).single()
+  if (data?.owner_id) ownerCache[vin] = data.owner_id
+  return data?.owner_id || null
 }
 
 async function maybeWriteLocation(vin) {
@@ -208,6 +220,7 @@ async function endTrip(vin, s) {
   console.error(`🏁 Trip ended: ${vin} distance=${distance}mi`)
   s.activeTripId = null
   s.tripStartOdometer = null
+  if (distance) await awardTripXp(vin, distance)
 }
 
 async function updateDrivingStats(vin, s) {
@@ -232,9 +245,154 @@ async function updateSafetyStats(vin, s) {
   }, { onConflict: 'vehicle_id' })
 }
 
+// ── GAMIFICATION ──
+
+const LEVELS = [
+  { level: 1, xp: 0 }, { level: 2, xp: 200 }, { level: 3, xp: 500 },
+  { level: 4, xp: 1000 }, { level: 5, xp: 2000 }, { level: 6, xp: 3500 },
+  { level: 7, xp: 5500 }, { level: 8, xp: 8000 }, { level: 9, xp: 11000 },
+  { level: 10, xp: 15000 },
+]
+
+function computeLevel(xp) {
+  let level = 1
+  for (const l of LEVELS) { if (xp >= l.xp) level = l.level }
+  return level
+}
+
+const BADGE_REQS = [
+  { name: '100 Miles',    icon: '🛣️', rarity: 'common',    xp: 50,   req: { type: 'miles',  value: 100 } },
+  { name: '500 Miles',    icon: '🗺️', rarity: 'rare',      xp: 150,  req: { type: 'miles',  value: 500 } },
+  { name: '1,000 Miles',  icon: '🌎', rarity: 'epic',      xp: 400,  req: { type: 'miles',  value: 1000 } },
+  { name: '5,000 Miles',  icon: '🌍', rarity: 'legendary', xp: 1000, req: { type: 'miles',  value: 5000 } },
+  { name: '10 Trips',     icon: '🚗', rarity: 'common',    xp: 50,   req: { type: 'trips',  value: 10 } },
+  { name: '50 Trips',     icon: '🚘', rarity: 'rare',      xp: 150,  req: { type: 'trips',  value: 50 } },
+  { name: '100 Trips',    icon: '🏁', rarity: 'epic',      xp: 400,  req: { type: 'trips',  value: 100 } },
+  { name: '500 Trips',    icon: '🏆', rarity: 'legendary', xp: 1000, req: { type: 'trips',  value: 500 } },
+]
+
+async function checkAndAwardBadges(userId, totalMiles, totalTrips) {
+  const { data: existing } = await supabase.from('user_badges').select('badge_name').eq('user_id', userId)
+  const earned = new Set((existing || []).map(b => b.badge_name))
+  const toAward = []
+  let bonusXp = 0
+  for (const badge of BADGE_REQS) {
+    if (earned.has(badge.name)) continue
+    const { type, value } = badge.req
+    const qualifies = (type === 'miles' && totalMiles >= value) || (type === 'trips' && totalTrips >= value)
+    if (qualifies) {
+      toAward.push({ user_id: userId, badge_name: badge.name, icon: badge.icon, rarity: badge.rarity, xp_earned: badge.xp, unlocked_at: new Date().toISOString() })
+      bonusXp += badge.xp
+      console.error(`🏅 Badge unlocked: ${badge.name} for ${userId} (+${badge.xp} XP)`)
+    }
+  }
+  if (toAward.length > 0) await supabase.from('user_badges').insert(toAward)
+  return bonusXp
+}
+
+async function updateActiveChallenges(userId, totalMiles, totalTrips, totalStreets, totalXp) {
+  const { data: challenges } = await supabase.from('family_challenges').select('id, type').eq('status', 'active')
+  if (!challenges?.length) return
+  for (const c of challenges) {
+    const score =
+      c.type === 'most_miles'   ? totalMiles :
+      c.type === 'most_trips'   ? totalTrips :
+      c.type === 'most_streets' ? totalStreets :
+      c.type === 'most_xp'      ? totalXp : 0
+    await supabase.from('challenge_entries').upsert(
+      { challenge_id: c.id, user_id: userId, score, updated_at: new Date().toISOString() },
+      { onConflict: 'challenge_id,user_id' }
+    )
+  }
+}
+
+async function awardTripXp(vin, tripMiles) {
+  const ownerId = await getOwner(vin)
+  if (!ownerId) return
+
+  const { data: member } = await supabase.from('family_members')
+    .select('xp, total_miles, total_trips').eq('id', ownerId).single()
+  if (!member) return
+
+  const newMiles = (member.total_miles || 0) + tripMiles
+  const newTrips = (member.total_trips || 0) + 1
+  const tripXp   = 10 + Math.floor(tripMiles)
+  const bonusXp  = await checkAndAwardBadges(ownerId, newMiles, newTrips)
+  const newXp    = (member.xp || 0) + tripXp + bonusXp
+  const level    = computeLevel(newXp)
+
+  await supabase.from('family_members').update({ xp: newXp, level, total_miles: newMiles, total_trips: newTrips }).eq('id', ownerId)
+  await supabase.from('xp_events').insert({ user_id: ownerId, amount: tripXp, reason: `Trip (${tripMiles.toFixed(1)} mi)`, created_at: new Date().toISOString() })
+
+  const { count: streetCount } = await supabase.from('user_street_progress')
+    .select('*', { count: 'exact', head: true }).eq('user_id', ownerId).eq('completed', true)
+  await updateActiveChallenges(ownerId, newMiles, newTrips, streetCount || 0, newXp)
+  console.error(`⭐ XP: ${ownerId} +${tripXp}trip +${bonusXp}badge = ${newXp} total`)
+}
+
+// ── STREET LOGGING ──
+
+const TREE_WORDS = new Set(['oak','maple','pine','elm','cedar','birch','willow','walnut','cherry','ash','cypress','magnolia','poplar','spruce','hickory','chestnut','sycamore','pecan','cottonwood','redwood'])
+const PRES_NAMES = new Set(['washington','lincoln','jefferson','adams','madison','monroe','jackson','harrison','tyler','polk','taylor','fillmore','pierce','buchanan','cleveland','garfield','arthur','mckinley','roosevelt','taft','wilson','harding','coolidge','hoover','truman','eisenhower','kennedy','johnson','nixon','ford','carter','reagan','clinton','obama','trump','biden'])
+const COLOR_WORDS = new Set(['red','blue','green','yellow','orange','purple','white','black','silver','gold','brown','gray','grey','violet','indigo','scarlet','crimson','azure'])
+
+function categorizeStreet(name) {
+  const words = name.toLowerCase().split(/[\s,\-]+/)
+  if (words.some(w => TREE_WORDS.has(w))) return 'tree'
+  if (words.some(w => PRES_NAMES.has(w))) return 'presidential'
+  if (/^\d+(st|nd|rd|th)\b/i.test(name)) return 'numbered_first'
+  if (words.some(w => COLOR_WORDS.has(w))) return 'color'
+  return null
+}
+
+// Nominatim requires 1 req/sec — track last call time
+let lastGeocodeMs = 0
+
+async function maybeLogStreet(vin, s) {
+  if (!s.lat || !s.lng || !s.odometer) return
+  const lastOdo = s.lastStreetOdometer || 0
+  if (s.odometer - lastOdo < 0.25) return  // geocode every ~0.25 miles
+  s.lastStreetOdometer = s.odometer
+
+  const ownerId = await getOwner(vin)
+  if (!ownerId) return
+
+  // Throttle to 1 req/sec for Nominatim ToS compliance
+  const now = Date.now()
+  const wait = 1100 - (now - lastGeocodeMs)
+  if (wait > 0) await new Promise(r => setTimeout(r, wait))
+  lastGeocodeMs = Date.now()
+
+  try {
+    const res = await fetch(
+      `https://nominatim.openstreetmap.org/reverse?lat=${s.lat}&lon=${s.lng}&format=json`,
+      { headers: { 'User-Agent': 'FlockApp/1.0 (reg2point1@gmail.com)' } }
+    )
+    const geo = await res.json()
+    const road = geo?.address?.road
+    if (!road) return
+
+    const category = categorizeStreet(road)
+    if (!category) return
+
+    const { data: existing } = await supabase.from('user_street_progress')
+      .select('id').eq('user_id', ownerId).eq('street_name', road).maybeSingle()
+    if (existing) return
+
+    await supabase.from('user_street_progress').insert({
+      user_id: ownerId,
+      street_name: road,
+      category,
+      completed: true,
+      first_driven_at: new Date().toISOString()
+    })
+    console.error(`🌳 Street: ${road} (${category}) → ${ownerId}`)
+  } catch {
+    // network error or rate limit — skip silently
+  }
+}
+
 // ── PAYLOAD PROCESSOR ──
-// Handles both proto JSON format {key, value: {floatValue: x}}
-// and simplified format {key, value: x}
 
 async function processTelemetryPayload(payload) {
   const vin = payload.vin
@@ -265,8 +423,6 @@ async function processTelemetryPayload(payload) {
 }
 
 // ── STDIN READER ──
-// Reads JSON lines from fleet-telemetry Go server (piped via stdout)
-// App logs have no 'vin'; telemetry records do.
 
 const rl = createInterface({ input: process.stdin, crlfDelay: Infinity })
 
@@ -277,7 +433,7 @@ rl.on('line', async (line) => {
     if (!record.vin) return
     await processTelemetryPayload(record)
   } catch {
-    // ignore parse errors from non-JSON log lines
+    // ignore non-JSON log lines
   }
 })
 
