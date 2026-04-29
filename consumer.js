@@ -194,8 +194,11 @@ async function writeTripPoint(vin, s) {
 async function startTrip(vin, s) {
   const vehicleId = await getVehicleId(vin)
   if (!vehicleId) return
+  const { data: activeDriver } = await supabase.from('vehicle_active_drivers')
+    .select('driver_id').eq('vehicle_id', vehicleId).maybeSingle()
   const { data: trip } = await supabase.from('trips').insert({
     vehicle_id: vehicleId,
+    driver_id: activeDriver?.driver_id || null,
     start_time: new Date().toISOString(),
     start_location: s.lat && s.lng ? `${s.lat},${s.lng}` : null
   }).select().single()
@@ -340,7 +343,7 @@ function categorizeStreet(name) {
   const words = name.toLowerCase().split(/[\s,\-]+/)
   if (words.some(w => TREE_WORDS.has(w))) return 'tree'
   if (words.some(w => PRES_NAMES.has(w))) return 'presidential'
-  if (/^\d+(st|nd|rd|th)\b/i.test(name)) return 'numbered_first'
+  if (/^\d+(st|nd|rd|th)/i.test(name)) return 'numbered_first'
   if (words.some(w => COLOR_WORDS.has(w))) return 'color'
   return null
 }
