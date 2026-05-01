@@ -1,8 +1,8 @@
 FROM golang:1.23-alpine AS builder
 RUN apk add --no-cache git ca-certificates
 WORKDIR /src
-RUN git clone --depth=1 https://github.com/teslamotors/fleet-telemetry .
-RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o /fleet-telemetry ./cmd/
+RUN git clone --depth=1 https://github.com/teslamotors/fleet-telemetry . && \
+    CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o /fleet-telemetry ./cmd/
 
 FROM node:20-alpine
 RUN apk add --no-cache ca-certificates
