@@ -26,5 +26,6 @@ cat > /tmp/ft-config.json << EOF
 }
 EOF
 
+echo "TCP proxy: ${RAILWAY_TCP_PROXY_DOMAIN}:${RAILWAY_TCP_PROXY_PORT}"
 echo "fleet-telemetry starting on port $PORT"
 fleet-telemetry -config /tmp/ft-config.json | node consumer.js
