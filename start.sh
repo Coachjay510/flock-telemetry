@@ -17,4 +17,4 @@ cat > /tmp/ft-config.json << EOF
 EOF
 
 echo "fleet-telemetry starting on port $PORT"
-fleet-telemetry -config /tmp/ft-config.json 2>&1 | node consumer.js
+fleet-telemetry -config /tmp/ft-config.json | node consumer.js
