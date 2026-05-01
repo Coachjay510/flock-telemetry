@@ -30,7 +30,7 @@ FROM node:20-alpine
 RUN apk add --no-cache ca-certificates
 COPY --from=builder /fleet-telemetry /usr/local/bin/fleet-telemetry
 WORKDIR /app
-COPY package.json ./
+COPY package.json package-lock.json ./
 RUN npm ci --production
 COPY consumer.js start.sh ./
 RUN chmod +x start.sh
