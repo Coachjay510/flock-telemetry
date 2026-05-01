@@ -26,8 +26,8 @@ ENV CGO_ENABLED=1
 ENV CGO_LDFLAGS="-lstdc++"
 RUN go build --ldflags 'extldflags="-static"' -o /fleet-telemetry ./cmd/
 
-FROM node:20-alpine
-RUN apk add --no-cache ca-certificates
+FROM node:20-slim
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/*
 COPY --from=builder /fleet-telemetry /usr/local/bin/fleet-telemetry
 WORKDIR /app
 COPY package.json package-lock.json ./
