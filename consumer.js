@@ -39,6 +39,7 @@ function getState(vin) {
       activeTripId: null, tripStartOdometer: null,
       lastWritten: 0,
       lastStreetOdometer: null,
+      lastLocationOdometer: null,
     }
   }
   return vehicleState[vin]
@@ -87,6 +88,7 @@ async function handleOdometer(vin, value) {
     if (s.activeTripId && s.lat && s.lng) await writeTripPoint(vin, s)
     await updateDrivingStats(vin, s)
     await maybeLogStreet(vin, s)
+    await maybeLogLocationVisit(vin, s)
   }
   s.lastOdometer = s.odometer
   s.odometer = value
@@ -392,6 +394,111 @@ async function maybeLogStreet(vin, s) {
     console.error(`🌳 Street: ${road} (${category}) → ${ownerId}`)
   } catch {
     // network error or rate limit — skip silently
+  }
+}
+
+// ── LOCATION GROUP VISITS ──
+
+function haversineMeters(lat1, lng1, lat2, lng2) {
+  const R = 6371000
+  const toRad = d => d * Math.PI / 180
+  const dLat = toRad(lat2 - lat1)
+  const dLng = toRad(lng2 - lng1)
+  const a = Math.sin(dLat / 2) ** 2 +
+    Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLng / 2) ** 2
+  return R * 2 * Math.asin(Math.sqrt(a))
+}
+
+let groupLocationsCache = null
+let groupLocationsCacheAt = 0
+async function getGroupLocations() {
+  const now = Date.now()
+  if (groupLocationsCache && now - groupLocationsCacheAt < 10 * 60 * 1000) return groupLocationsCache
+  const { data } = await supabase.from('group_locations').select('id, group_id, name, lat, lng, radius_meters')
+  groupLocationsCache = data || []
+  groupLocationsCacheAt = now
+  return groupLocationsCache
+}
+
+async function maybeLogLocationVisit(vin, s) {
+  if (!s.lat || !s.lng || !s.odometer) return
+  const lastOdo = s.lastLocationOdometer || 0
+  if (s.odometer - lastOdo < 0.25) return
+  s.lastLocationOdometer = s.odometer
+
+  const ownerId = await getOwner(vin)
+  if (!ownerId) return
+
+  const locations = await getGroupLocations()
+  if (!locations.length) return
+
+  for (const loc of locations) {
+    const dist = haversineMeters(s.lat, s.lng, Number(loc.lat), Number(loc.lng))
+    if (dist > loc.radius_meters) continue
+
+    const { data: newVisit, error } = await supabase
+      .from('user_location_visits')
+      .insert({ user_id: ownerId, location_id: loc.id })
+      .select('id')
+      .maybeSingle()
+
+    if (error && error.code !== '23505') {
+      console.error(`Location visit insert error: ${error.message}`)
+      continue
+    }
+
+    if (newVisit) {
+      console.error(`📍 Location visit: ${loc.name} → ${ownerId}`)
+      await checkLocationGroupCompletion(ownerId, loc.group_id)
+    }
+  }
+}
+
+async function checkLocationGroupCompletion(userId, groupId) {
+  const { count: total } = await supabase
+    .from('group_locations')
+    .select('*', { count: 'exact', head: true })
+    .eq('group_id', groupId)
+
+  if (!total) return
+
+  const { count: visited } = await supabase
+    .from('user_location_visits')
+    .select('*, group_locations!inner(group_id)', { count: 'exact', head: true })
+    .eq('user_id', userId)
+    .eq('group_locations.group_id', groupId)
+
+  if (visited < total) {
+    console.error(`📍 Group progress: ${visited}/${total} for group ${groupId}`)
+    return
+  }
+
+  const { data: group } = await supabase
+    .from('location_groups')
+    .select('name, badge_rarity, xp_reward')
+    .eq('id', groupId)
+    .single()
+
+  if (!group) return
+
+  const { error: badgeErr } = await supabase
+    .from('user_badges')
+    .insert({ user_id: userId, badge_name: group.name, category: 'location_group', unlocked_at: new Date().toISOString() })
+
+  if (badgeErr && badgeErr.code !== '23505') {
+    console.error(`Location group badge insert error: ${badgeErr.message}`)
+    return
+  }
+
+  if (!badgeErr) {
+    console.error(`🏅 Location group badge: "${group.name}" for ${userId} (+${group.xp_reward} XP)`)
+    const { data: member } = await supabase.from('family_members').select('xp').eq('id', userId).single()
+    if (member) {
+      const newXp = (member.xp || 0) + group.xp_reward
+      const level = computeLevel(newXp)
+      await supabase.from('family_members').update({ xp: newXp, level }).eq('id', userId)
+      await supabase.from('xp_events').insert({ user_id: userId, amount: group.xp_reward, reason: `Badge: ${group.name}`, created_at: new Date().toISOString() })
+    }
   }
 }
 
